@@ -16,9 +16,9 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
-from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+from PIL import Image
 
 
 from datasets import DPO_Dataset
@@ -121,6 +121,29 @@ def parse_args():
         "--do_train",
         action="store_true",
         help="지정하면 학습을 실행합니다.",
+    )
+    parser.add_argument(
+        "--do_inference",
+        action="store_true",
+        help="지정하면 validation split으로 추론을 실행합니다.",
+    )
+    parser.add_argument(
+        "--inference_output_dir",
+        type=str,
+        default="./results/inference",
+        help="추론 결과 이미지가 저장될 디렉터리입니다.",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=50,
+        help="DDPM reverse sampling step 수입니다.",
+    )
+    parser.add_argument(
+        "--max_inference_samples",
+        type=int,
+        default=None,
+        help="저장할 최대 추론 샘플 수입니다. 미지정 시 validation 전체를 사용합니다.",
     )
     parser.add_argument(
         "--num_train_epochs",
@@ -278,6 +301,9 @@ def parse_args():
     if args.beta_dpo <= 0:
         raise ValueError("--beta_dpo must be greater than 0.")
 
+    if args.num_inference_steps < 1:
+        raise ValueError("--num_inference_steps must be greater than 0.")
+
     return args
 
 
@@ -330,6 +356,142 @@ def save_models(
     )
 
     logger.info(f"Saved UNet checkpoint to {save_dir}")
+
+
+
+def resolve_unet_checkpoint(checkpoint_dir, checkpoint_epoch):
+    candidates = [
+        os.path.join(checkpoint_dir, f"epoch_{checkpoint_epoch}", "unet.pt"),
+        os.path.join(checkpoint_dir, f"epoch_{checkpoint_epoch}.pt"),
+        os.path.join(checkpoint_dir, "unet.pt"),
+    ]
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+
+    raise FileNotFoundError(
+        "UNet checkpoint를 찾을 수 없습니다. 확인한 경로: "
+        + ", ".join(candidates)
+    )
+
+
+def get_conditioning(batch, device, dtype):
+    for key in ("conditioning", "encoder_hidden_states", "prompt_embeds"):
+        if key in batch:
+            conditioning = batch[key]
+            if not torch.is_tensor(conditioning):
+                raise TypeError(f'batch["{key}"] must be a torch.Tensor.')
+            return conditioning.to(
+                device=device,
+                dtype=dtype,
+                non_blocking=True,
+            )
+
+    raise KeyError(
+        "Batch에 conditioning tensor가 없습니다. "
+        "지원 key: conditioning, encoder_hidden_states, prompt_embeds"
+    )
+
+
+def save_image_tensor(image, path):
+    image = image.detach().float().cpu().clamp(-1, 1)
+    image = ((image + 1.0) * 127.5).round().to(torch.uint8)
+    image = image.permute(1, 2, 0).numpy()
+
+    if image.shape[-1] == 1:
+        image = image[..., 0]
+
+    Image.fromarray(image).save(path)
+
+
+@torch.no_grad()
+def run_inference(
+    unet,
+    vae,
+    noise_scheduler,
+    dataloader,
+    device,
+    weight_dtype,
+    output_dir,
+    num_inference_steps,
+    max_inference_samples=None,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    unet.eval()
+    vae.eval()
+
+    noise_scheduler.set_timesteps(
+        num_inference_steps,
+        device=device,
+    )
+
+    sample_index = 0
+    progress = tqdm(dataloader, desc="Inference")
+
+    for batch in progress:
+        source_img = batch["source_img"].to(
+            device=device,
+            dtype=weight_dtype,
+            non_blocking=True,
+        )
+        conditioning = get_conditioning(
+            batch,
+            device=device,
+            dtype=weight_dtype,
+        )
+
+        source_latents = vae.encode(source_img).latent_dist.mode()
+        source_latents = source_latents * vae.config.scaling_factor
+
+        latents = torch.randn_like(source_latents)
+        if hasattr(noise_scheduler, "init_noise_sigma"):
+            latents = latents * noise_scheduler.init_noise_sigma
+
+        for timestep in noise_scheduler.timesteps:
+            timestep_batch = timestep.expand(latents.shape[0])
+            latent_model_input = torch.cat(
+                [latents, source_latents],
+                dim=1,
+            )
+
+            noise_pred = unet(
+                latent_model_input,
+                timestep_batch,
+                conditioning,
+                return_dict=False,
+            )[0]
+
+            latents = noise_scheduler.step(
+                noise_pred,
+                timestep,
+                latents,
+                return_dict=False,
+            )[0]
+
+        decoded = vae.decode(
+            latents / vae.config.scaling_factor,
+            return_dict=False,
+        )[0]
+
+        for image in decoded:
+            save_path = os.path.join(
+                output_dir,
+                f"sample_{sample_index:06d}.png",
+            )
+            save_image_tensor(image, save_path)
+            sample_index += 1
+
+            if (
+                max_inference_samples is not None
+                and sample_index >= max_inference_samples
+            ):
+                logger.info(
+                    f"Saved {sample_index} inference samples to {output_dir}"
+                )
+                return
+
+    logger.info(f"Saved {sample_index} inference samples to {output_dir}")
 
 
 def main():
@@ -393,11 +555,9 @@ def main():
     # =========================================================================
     # CHECKPOINT PATHS
     # =========================================================================
-    checkpoint_name = f"epoch_{args.checkpoint_epoch}.pt"
-
-    unet_checkpoint_path = os.path.join(
+    unet_checkpoint_path = resolve_unet_checkpoint(
         args.pretrained_checkpoint_dir,
-        checkpoint_name,
+        args.checkpoint_epoch,
     )
 
     # =========================================================================
@@ -429,8 +589,6 @@ def main():
         num_workers=args.val_dataloader_num_workers,
         pin_memory=True,
     )
-
-    del val_dataloader
 
     # =========================================================================
     # DIFFUSION MODEL BOILERPLATE
@@ -600,6 +758,22 @@ def main():
         f"  Total optimization steps = {args.max_train_steps}"
     )
 
+    if args.do_inference:
+        inference_unet = accelerator.unwrap_model(unet)
+        inference_unet.to(device=device, dtype=weight_dtype)
+
+        run_inference(
+            unet=inference_unet,
+            vae=vae,
+            noise_scheduler=noise_scheduler,
+            dataloader=val_dataloader,
+            device=device,
+            weight_dtype=weight_dtype,
+            output_dir=args.inference_output_dir,
+            num_inference_steps=args.num_inference_steps,
+            max_inference_samples=args.max_inference_samples,
+        )
+
     if not args.do_train:
         logger.info(
             "Training is disabled. "
@@ -746,7 +920,11 @@ def main():
                 # Prepare conditioning
                 # -------------------------------------------------------------
                 with torch.no_grad():
-
+                    conditioning = get_conditioning(
+                        batch,
+                        device=device,
+                        dtype=weight_dtype,
+                    )
                     conditioning = conditioning.repeat(
                         2,
                         1,
@@ -791,7 +969,7 @@ def main():
                     ref_diff = ref_losses_w - ref_losses_l
                     raw_ref_loss = ref_losses.mean()    
                     
-                scale_term = -0.5 * 2000
+                scale_term = -0.5 * args.beta_dpo
                 inside_term = scale_term * (model_diff - ref_diff)
                 implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
                 loss = -1 * F.logsigmoid(inside_term).mean()
